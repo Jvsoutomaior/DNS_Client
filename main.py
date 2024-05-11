@@ -1,5 +1,5 @@
-from DNS import cabecalhoDNS, perguntaDNS, registroDNS
-from io import BytesIO
+from DNS import CabecalhoDNS, PerguntaDNS
+from sys import argv
 import socket, select
 import struct
 import random
@@ -7,15 +7,20 @@ import random
 
 def cria_requisicao(dominio):
     id = random.randint(0, 65535)
-    cabecalho = cabecalhoDNS(id=id)
-    pergunta = perguntaDNS(nome=codifica_nome(dominio))
+    cabecalho = CabecalhoDNS(id=id)
+    pergunta = PerguntaDNS(nome=codifica_nome(dominio))
     return cabecalho.to_bytes() + pergunta.to_bytes()
 
 
-def envia_requisicao(requisicao, servidorDNS):
+def envia_requisicao(requisicao, servidorDNS, tentativa):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(2)
     sock.sendto(requisicao, (servidorDNS, 53))
+
+    if tentativa == 3:
+        print(f"Nao foi possível coletar entrada NS para {argv[1]}")
+        sock.close()
+        exit()
 
     try:
         # Monitora o socket verificando se ele esta pronto para realizar a leitura,
@@ -24,15 +29,14 @@ def envia_requisicao(requisicao, servidorDNS):
 
         if ready[0]:
             resposta, _ = sock.recvfrom(1024)
-            print("Resposta recebida:", resposta)
             return resposta
         else:
-            print("Timeout. Tentando novamente...")
-            return envia_requisicao(requisicao, servidorDNS)
+            tentativa += 1
+            return envia_requisicao(requisicao, servidorDNS, tentativa)
 
     except socket.timeout:
-        print("Timeout. Tentando novamente...")
-        return envia_requisicao(requisicao, servidorDNS)
+        tentativa += 1
+        return envia_requisicao(requisicao, servidorDNS, tentativa)
 
     finally:
         sock.close()
@@ -45,48 +49,74 @@ def codifica_nome(nome):
     return nome_bytes + b"\x00"
 
 
-def decodifica_nome(reader):
-    parts = []
-    while (length := reader.read(1)[0]) != 0:
-        if length & 0b1100_0000:
-            parts.append(decodifica_nome_comp(length, reader))
+def decodifica_nome(resposta, offset):
+    nome = ""
+    while True:
+        tamanho = resposta[offset]
+        if tamanho == 0:
+            offset += 1
+            break
+        if tamanho >= 192:  # caso tenha compressao
+            pointer = struct.unpack("!H", resposta[offset : offset + 2])[0] & 0x3FFF
+            nome_parte, _ = decodifica_nome(resposta, pointer)
+            nome += nome_parte
+            offset += 2
             break
         else:
-            parts.append(reader.read(length))
-    return b".".join(parts)
-
-
-def decodifica_nome_comp(length, reader):
-    pointer_bytes = bytes([length & 0b0011_1111]) + reader.read(1)
-    pointer = struct.unpack("!H", pointer_bytes)[0]
-    current_pos = reader.tell()
-    reader.seek(pointer)
-    result = decodifica_nome(reader)
-    reader.seek(current_pos)
-    return result
-
-
-def interpreta_cabecalho(reader):
-    items = struct.unpack("!HHHHHH", reader.read(12))
-    return cabecalhoDNS(*items)
-
-
-def interpreta_pergunta(reader):
-    nome = decodifica_nome(reader)
-    return perguntaDNS(nome)
+            nome += resposta[offset + 1 : offset + 1 + tamanho].decode("utf-8") + "."
+            offset += tamanho + 1
+    return nome, offset
 
 
 def interpreta_resposta(resposta):
-    reader = BytesIO(resposta)
-    cabecalho = interpreta_cabecalho(reader)
-    pergunta = interpreta_pergunta(reader)
-    print(f"{cabecalho}\n{pergunta}")
-    # interpretar registro NS
+    cabecalho = struct.unpack("!6H", resposta[:12])
+    flags = cabecalho[1]
+    qtd_perguntas = cabecalho[2]
+    qtd_respostas = cabecalho[3]
+    rcode = flags & 0xF
+
+    # Response Code 3: Name error (domain name referenced in the query does not exist)
+    if rcode == 3:
+        print(f"Dominio {argv[1]} nao encontrado")
+        exit()
+
+    # Pula as perguntas
+    offset = 12
+    for _ in range(qtd_perguntas):
+        while resposta[offset] != 0:
+            offset += 1
+        offset += 5
+
+    # Interpreta as respostas
+    ns_list = []
+    for _ in range(qtd_respostas):
+        _, offset = decodifica_nome(resposta, offset)
+        rr_tipo, _, _, rd_tamanho = struct.unpack(
+            "!2HIH", resposta[offset : offset + 10]
+        )
+        offset += 10
+        if rr_tipo == 2:  # NS
+            ns_nome, offset = decodifica_nome(resposta, offset)
+            ns_list.append(ns_nome)
+        else:
+            offset += rd_tamanho
+    return ns_list
 
 
-# req = cria_requisicao("unb.br")
-# resposta = envia_requisicao(req, "8.8.8.8")
+if len(argv) < 3:
+    print("Exemplo de uso: python main.py unb.br 8.8.8.8")
+    exit()
 
-# exemplo de resposta
-resposta = b"\xe7\x81\x81\x80\x00\x01\x00\x03\x00\x00\x00\x00\x03unb\x02br\x00\x00\x02\x00\x01\xc0\x0c\x00\x02\x00\x01\x00\x00\x01\xda\x00\x07\x04dns3\xc0\x0c\xc0\x0c\x00\x02\x00\x01\x00\x00\x01\xda\x00\x07\x04dns1\xc0\x0c\xc0\x0c\x00\x02\x00\x01\x00\x00\x01\xda\x00\x07\x04dns2\xc0\x0c"
-interpreta_resposta(resposta)
+dominio = argv[1]
+servidor_dns = argv[2]
+
+req = cria_requisicao(dominio)
+resposta = envia_requisicao(req, servidor_dns, 1)
+
+ns_list = interpreta_resposta(resposta)
+
+if not ns_list:
+    print(f"Dominio {dominio} nao possui entrada NS")
+
+for i in ns_list:
+    print(f"{dominio} <> {i}")
